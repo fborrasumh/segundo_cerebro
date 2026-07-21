@@ -471,7 +471,13 @@ const el = (tag, attrs = {}, children = []) => {
   }
   (Array.isArray(children) ? children : [children]).forEach(c => {
     if (c === null || c === undefined) return;
-    n.appendChild(typeof c === 'string' ? document.createTextNode(c) : c);
+    if (c instanceof Node) { n.appendChild(c); return; }
+    if (typeof c === 'string' || typeof c === 'number') { n.appendChild(document.createTextNode(String(c))); return; }
+    // Salvaguarda: si algo (p. ej. una respuesta de la IA mal formada) cuela un
+    // objeto/array en vez de un Node o string, lo mostramos como texto en vez
+    // de romper toda la vista con "appendChild: parameter 1 is not of type Node".
+    try { n.appendChild(document.createTextNode(typeof c === 'object' ? JSON.stringify(c) : String(c))); }
+    catch { /* ignorar hijos irrepresentables */ }
   });
   return n;
 };
@@ -2830,6 +2836,19 @@ async function renderGrafoView() {
 /* ---------------------------------------------------------------------------
    23. VISTA: LINT (salud de la wiki) con fusión de duplicados (#2, #11)
 --------------------------------------------------------------------------- */
+function lintItemText(i) {
+  if (i === null || i === undefined) return '';
+  if (typeof i === 'string' || typeof i === 'number') return String(i);
+  if (typeof i === 'object') {
+    // formas habituales que devuelven los modelos para "missing_data"/"suggestions"
+    const candidate = i.text || i.description || i.suggestion || i.issue || i.article || i.title || i.name;
+    if (candidate) return String(candidate);
+    try { return JSON.stringify(i); } catch { return String(i); }
+  }
+  return String(i);
+}
+function synonymLabel(s) { return `${lintItemText(s.name1 ?? s.title1 ?? '')} ↔ ${lintItemText(s.name2 ?? s.title2 ?? '')}`; }
+
 async function renderLintView() {
   const root = $('#view-lint'); root.innerHTML = '';
   root.appendChild(el('div', { class: 'card', style: 'display:flex;justify-content:space-between;align-items:center' }, [
@@ -2864,7 +2883,7 @@ async function renderLintView() {
         } }, [el('span', { html: ICONS.merge }), 'Fusionar todos automáticamente']));
         const list = el('div', { style: 'margin-top:6px' });
         raw.synonyms.forEach(s => list.appendChild(el('div', { class: 'item-row', style: 'cursor:default' }, [
-          el('div', { class: 'item-main' }, `${s.name1 || ''} ↔ ${s.name2 || ''}`),
+          el('div', { class: 'item-main' }, synonymLabel(s)),
           el('button', { class: 'btn btn-sm', onclick: async (e) => { e.target.disabled = true; await mergePairByTitles(s.name1, s.name2, articles); toast('Artículos fusionados.', 'success'); await refreshSidebar(); renderLintView(); } }, [el('span', { html: ICONS.merge }), 'Fusionar']),
         ])));
         synonymsBox.appendChild(list);
@@ -2873,9 +2892,9 @@ async function renderLintView() {
       }
 
       const sections = [
-        { key: 'broken_links', label: '🔗 Enlaces rotos', render: i => `${i.file || ''} → [[${i.missing_link || ''}]]` },
-        { key: 'missing_data', label: '⚠️ Contenido incompleto', render: i => i },
-        { key: 'suggestions', label: '💡 Sugerencias', render: i => i },
+        { key: 'broken_links', label: '🔗 Enlaces rotos', render: i => typeof i === 'string' ? i : `${i.file || i.article || ''} → [[${i.missing_link || i.link || ''}]]` },
+        { key: 'missing_data', label: '⚠️ Contenido incompleto', render: lintItemText },
+        { key: 'suggestions', label: '💡 Sugerencias', render: lintItemText },
       ];
       const grid = el('div', { class: 'grid grid-2' }, [synonymsBox]);
       sections.forEach(s => {
@@ -2893,9 +2912,13 @@ async function renderLintView() {
   });
 }
 async function mergePairByTitles(title1, title2, articles) {
-  const a = articles.find(x => x.title.toLowerCase() === (title1 || '').toLowerCase());
-  const b = articles.find(x => x.title.toLowerCase() === (title2 || '').toLowerCase());
+  const t1 = lintItemText(title1).toLowerCase();
+  const t2 = lintItemText(title2).toLowerCase();
+  if (!t1 || !t2) { toast('No se pudo identificar el par de artículos a fusionar.', 'error'); return; }
+  const a = articles.find(x => x.title.toLowerCase() === t1);
+  const b = articles.find(x => x.title.toLowerCase() === t2);
   if (a && b && a.id !== b.id) await mergeArticles(a.id, b.id);
+  else toast('No se encontraron ambos artículos para fusionar (puede que ya se hayan fusionado).', 'error');
 }
 
 /* ---------------------------------------------------------------------------
