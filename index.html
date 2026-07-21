@@ -700,9 +700,9 @@ function renderMarkdownInto(container, md) {
   $$('.wikilink', container).forEach(a => a.addEventListener('click', async () => {
     const title = a.getAttribute('data-wikilink');
     const arts = await getActiveArticles();
-    const match = arts.find(x => x.title.toLowerCase() === title.toLowerCase()) ||
-                  arts.find(x => x.title.toLowerCase().includes(title.toLowerCase()));
-    if (match) openArticleModal(match); else toast(`No existe todavía un artículo "${title}"`, 'info');
+    const resolved = resolveWikilinkTarget(title, arts.map(x => x.title));
+    const match = resolved ? arts.find(x => x.title === resolved) : null;
+    if (match) openArticleModal(match); else toast(`Todavía no existe un artículo "${title}" — es un enlace a la espera de crearse.`, 'info');
   }));
 }
 
@@ -777,26 +777,40 @@ async function findPossibleDuplicates(text, { threshold = 0.35 } = {}) {
 
 async function compileDocument(doc, { silent = false, templateKey = 'libre' } = {}) {
   const template = ARTICLE_TEMPLATES[templateKey] || ARTICLE_TEMPLATES.libre;
-  const system = `Eres un asistente de investigación que crea una wiki de conocimiento personal.
-Analiza el documento y devuelve JSON estricto con este formato:
+  const existingArticles = await getActiveArticles();
+  const existingTitles = existingArticles.map(a => a.title);
+  const titlesHint = existingTitles.length
+    ? `TÍTULOS QUE YA EXISTEN EN LA WIKI (si el contenido se relaciona con alguno, enlázalo con [[el título EXACTO tal cual aparece aquí]] en vez de inventar una redacción distinta para el mismo concepto):\n${existingTitles.slice(0, 200).join(' · ')}\n\n`
+    : '';
+  const system = `Eres un asistente de investigación que crea una wiki de conocimiento personal muy enlazada, al estilo Wikipedia/Obsidian.
+${titlesHint}Analiza el documento y devuelve JSON estricto con este formato:
 {
   "summary": "resumen de 3 líneas",
   "concepts": ["Concepto 1", "Concepto 2"],
-  "articles": [{"title": "Título del artículo", "content": "Contenido en Markdown, usa [[Enlaces]] a otros conceptos cuando tenga sentido"}]
+  "articles": [{"title": "Título del artículo", "content": "Contenido en Markdown"}]
 }
+Reglas de enlazado (importantes):
+- Enlaza generosamente: cada vez que menciones un concepto que ya exista en la wiki (lista de arriba) o que sea uno de los otros artículos que creas en esta misma respuesta, envuélvelo en [[dobles corchetes]] usando el título EXACTO.
+- Un artículo de longitud normal debería tener al menos 3-6 enlaces [[...]] si hay conceptos relacionados disponibles; no los fuerces si de verdad no vienen a cuento.
+- Si el concepto es nuevo y aún no existe como artículo, puedes enlazarlo igualmente con [[Nuevo Concepto]]: quedará como enlace a la espera de que ese artículo se cree más adelante.
 Crea entre 1 y 4 artículos por documento, uno por cada concepto principal distinto. El contenido debe ser sustancioso (mínimo 120 palabras cada uno).
 FORMATO DE CADA ARTÍCULO: ${template.instructions}`;
   const prompt = `Analiza el documento "${doc.title}".\n\nCONTENIDO:\n${(doc.text || '').slice(0, 9000)}`;
   const result = await callLLMJSON(system, prompt);
 
   const now = Date.now();
-  const articles = await getActiveArticles();
+  const articles = existingArticles;
   const createdOrUpdated = [];
+  const batchTitles = (result.articles || []).map(a => a.title);
 
   for (const art of (result.articles || [])) {
+    const knownTitles = existingTitles.concat(batchTitles).filter(t => t !== art.title);
+    let content = resolveLinksInContent(art.content, knownTitles);
+    content = autoLinkContent(content, knownTitles, art.title);
+
     const existing = articles.find(a => a.title.toLowerCase() === art.title.toLowerCase());
     if (existing) {
-      existing.content += `\n\n## Actualización desde "${doc.title}"\n${art.content}`;
+      existing.content += `\n\n## Actualización desde "${doc.title}"\n${content}`;
       existing.modifiedAt = now;
       existing.sources = Array.from(new Set([...(existing.sources || []), doc.id]));
       existing.embedding = null; // forzar reindexado
@@ -804,7 +818,7 @@ FORMATO DE CADA ARTÍCULO: ${template.instructions}`;
       createdOrUpdated.push(existing);
     } else {
       const newArt = {
-        id: uid(), title: art.title, content: art.content,
+        id: uid(), title: art.title, content,
         summary: result.summary || '', concepts: result.concepts || [], tags: doc.tags || [],
         sources: [doc.id], createdAt: now, modifiedAt: now, embedding: null, deletedAt: null,
       };
@@ -1000,21 +1014,115 @@ async function getAllTags() {
 --------------------------------------------------------------------------- */
 async function getBacklinks(article) {
   const others = await getActiveArticles();
-  return others.filter(a => a.id !== article.id && extractWikilinks(a.content).some(l => l.toLowerCase() === article.title.toLowerCase()));
+  return others.filter(a => a.id !== article.id && extractWikilinks(a.content).some(l => resolveWikilinkTarget(l, [article.title]) === article.title));
 }
 async function getOrphanArticles() {
   const articles = await getActiveArticles();
-  const titleSet = new Set(articles.map(a => a.title.toLowerCase()));
+  const titles = articles.map(a => a.title);
   const linkedTo = new Set();
-  articles.forEach(a => extractWikilinks(a.content).forEach(l => { if (titleSet.has(l.toLowerCase())) linkedTo.add(l.toLowerCase()); }));
+  articles.forEach(a => extractWikilinks(a.content).forEach(l => {
+    const resolved = resolveWikilinkTarget(l, titles);
+    if (resolved) linkedTo.add(resolved.toLowerCase());
+  }));
   return articles.filter(a => {
-    const outLinks = extractWikilinks(a.content).filter(l => titleSet.has(l.toLowerCase()));
+    const outLinks = extractWikilinks(a.content).map(l => resolveWikilinkTarget(l, titles)).filter(Boolean);
     return outLinks.length === 0 && !linkedTo.has(a.title.toLowerCase());
   });
 }
 
 function extractWikilinks(content) {
   return Array.from((content || '').matchAll(/\[\[([^\]]+)\]\]/g)).map(m => m[1]);
+}
+
+/* ---------------------------------------------------------------------------
+   13b. RESOLUCIÓN DIFUSA DE ENLACES Y AUTO-ENLAZADO
+   Arregla dos causas de "salen pocos enlaces":
+   1) La IA no sabía qué títulos ya existían en la wiki al procesar un documento.
+   2) Un [[enlace]] con redacción ligeramente distinta al título real no contaba
+      como conexión (ni en el grafo, ni en backlinks, ni en huérfanos).
+--------------------------------------------------------------------------- */
+function escapeRegex(s) { return (s || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+function normalizeForMatch(s) {
+  return (s || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^\w\s]/g, ' ').replace(/\s+/g, ' ').trim();
+}
+/* Dado el texto de un [[enlace]] y una lista de títulos candidatos, devuelve
+   el título real que mejor coincide (exacto normalizado, o contención mutua
+   con un mínimo de longitud para evitar falsos positivos triviales). */
+function resolveWikilinkTarget(linkText, candidateTitles) {
+  const norm = normalizeForMatch(linkText);
+  if (!norm) return null;
+  let hit = candidateTitles.find(t => normalizeForMatch(t) === norm);
+  if (hit) return hit;
+  if (norm.length >= 4) {
+    hit = candidateTitles.find(t => {
+      const nt = normalizeForMatch(t);
+      return nt.length >= 4 && (nt.includes(norm) || norm.includes(nt));
+    });
+    if (hit) return hit;
+  }
+  return null;
+}
+/* Reescribe cada [[enlace]] del contenido con el título EXACTO del artículo
+   real al que corresponde, cuando existe una coincidencia (difusa). Los
+   enlaces sin coincidencia se dejan tal cual (quedan como "enlace deseado",
+   listo para conectarse en cuanto exista ese artículo). */
+function resolveLinksInContent(content, knownTitles) {
+  return (content || '').replace(/\[\[([^\]]+)\]\]/g, (m, linkText) => {
+    const resolved = resolveWikilinkTarget(linkText, knownTitles);
+    return `[[${resolved || linkText}]]`;
+  });
+}
+/* Envuelve automáticamente en [[ ]] las menciones de títulos ya conocidos que
+   la IA haya dejado como texto plano, sin tocar enlaces existentes ni bloques
+   de código. Limita el nº de enlaces añadidos para no saturar el artículo. */
+function autoLinkContent(content, knownTitles, ownTitle, maxLinks = 6) {
+  if (!content) return content;
+  const candidates = Array.from(new Set(knownTitles))
+    .filter(t => t && t.toLowerCase() !== (ownTitle || '').toLowerCase() && t.trim().length >= 3)
+    .sort((a, b) => b.length - a.length); // términos largos primero (evita solapes parciales)
+  if (!candidates.length) return content;
+
+  const parts = content.split(/(\[\[[^\]]+\]\]|```[\s\S]*?```)/g);
+  const alreadyLinked = new Set(
+    (content.match(/\[\[([^\]]+)\]\]/g) || []).map(m => normalizeForMatch(m.slice(2, -2)))
+  );
+  let added = 0;
+  for (let i = 0; i < parts.length; i++) {
+    if (added >= maxLinks) break;
+    const part = parts[i];
+    if (!part || part.startsWith('[[') || part.startsWith('```')) continue;
+    let segment = part;
+    for (const title of candidates) {
+      if (added >= maxLinks) break;
+      if (alreadyLinked.has(normalizeForMatch(title))) continue;
+      const re = new RegExp(`\\b(${escapeRegex(title)})\\b`, 'i');
+      if (re.test(segment)) {
+        segment = segment.replace(re, `[[${title}]]`);
+        alreadyLinked.add(normalizeForMatch(title));
+        added++;
+      }
+    }
+    parts[i] = segment;
+  }
+  return parts.join('');
+}
+/* Pasada retroactiva: re-resuelve y auto-enlaza TODOS los artículos existentes
+   entre sí. Sirve para "reparar" wikis ya creadas con pocos enlaces. */
+async function relinkAllArticles(onProgress) {
+  const articles = await getActiveArticles();
+  const titles = articles.map(a => a.title);
+  let changed = 0, done = 0;
+  for (const a of articles) {
+    const before = a.content;
+    const others = titles.filter(t => t !== a.title);
+    let content = resolveLinksInContent(a.content, others);
+    content = autoLinkContent(content, others, a.title, 8);
+    if (content !== before) { a.content = content; a.modifiedAt = Date.now(); await dbPut('articles', a); changed++; }
+    done++;
+    onProgress && onProgress(done, articles.length, a.title);
+  }
+  return { changed, total: articles.length };
 }
 
 /* ---------------------------------------------------------------------------
@@ -1402,8 +1510,11 @@ async function agentPlanner(query, wikiContext = '') {
 JSON: {"subtopics":[],"research_questions":[],"priority_order":[]}`;
   return callLLMJSON(system, `CONSULTA: ${query}\n${wikiContext ? 'WIKI:\n' + wikiContext.slice(0, 4000) : ''}`);
 }
-async function agentResearcher(subtopic, query, existingWiki = '') {
-  const system = `Investigador. Escribe un artículo de wiki detallado sobre el subtema, en español, con Markdown y [[enlaces]] a otros conceptos.
+async function agentResearcher(subtopic, query, existingWiki = '', libraryTitles = []) {
+  const titlesHint = libraryTitles.length
+    ? `\nARTÍCULOS YA EXISTENTES EN TU BIBLIOTECA (enlaza con [[título EXACTO]] si el subtema se relaciona con alguno):\n${libraryTitles.slice(0, 150).join(' · ')}\n`
+    : '';
+  const system = `Investigador. Escribe un artículo de wiki detallado sobre el subtema, en español, con Markdown y [[enlaces]] a otros conceptos. Enlaza generosamente (3-6 enlaces si hay conceptos relacionados).${titlesHint}
 JSON: {"title":"","summary":"","concepts":[],"content":"(mínimo 250 palabras)"}`;
   let prompt = `CONSULTA GENERAL: ${query}\nSUBTEMA: ${subtopic}\n`;
   if (existingWiki) prompt += `CONTEXTO EXISTENTE (expande, no repitas):\n${existingWiki.slice(0, 3000)}`;
@@ -1430,6 +1541,7 @@ async function deepResearch(query, iterations = 2, onLog) {
   const log = (text, type = 'ok') => onLog && onLog({ text, type });
   const wiki = new EphemeralWiki();
   const iterationLog = [];
+  const libraryTitles = (await getActiveArticles()).map(a => a.title);
   log(`Deep research: "${query}" · ${iterations} iteración(es)`, 'head');
 
   for (let iter = 0; iter < iterations; iter++) {
@@ -1442,7 +1554,7 @@ async function deepResearch(query, iterations = 2, onLog) {
     let newArts = 0;
     for (const subtopic of subtopics) {
       try {
-        const art = await agentResearcher(subtopic, query, wiki.articles[subtopic] || '');
+        const art = await agentResearcher(subtopic, query, wiki.articles[subtopic] || '', libraryTitles);
         wiki.addArticle(art.title, art.content, art.summary, art.concepts);
         newArts++;
         log(`  ✓ Investigado: ${art.title}`);
@@ -1458,7 +1570,7 @@ async function deepResearch(query, iterations = 2, onLog) {
       iterationLog.push({ action: `Crítica it.${iter + 1}`, result: `Lagunas: ${(critique.gaps || []).slice(0, 2).join('; ')}` });
       for (const miss of (critique.missing_subtopics || []).slice(0, 3)) {
         try {
-          const art = await agentResearcher(miss, query);
+          const art = await agentResearcher(miss, query, '', libraryTitles);
           wiki.addArticle(art.title, art.content, art.summary, art.concepts);
           log(`  ✓ Cubierto hueco: ${art.title}`);
         } catch (e) { log(`  ✗ ${e.message}`, 'err'); }
@@ -1490,7 +1602,11 @@ async function deepResearch(query, iterations = 2, onLog) {
 }
 
 async function saveResearchToWiki(report) {
-  for (const [title, content] of Object.entries(report.wikiArticles)) {
+  const libraryTitles = (await getActiveArticles()).map(a => a.title);
+  const reportOwnTitles = Object.keys(report.wikiArticles);
+  for (const [title, rawContent] of Object.entries(report.wikiArticles)) {
+    const knownTitles = libraryTitles.concat(reportOwnTitles).filter(t => t !== title);
+    const content = autoLinkContent(resolveLinksInContent(rawContent, knownTitles), knownTitles, title);
     const articles = await getActiveArticles();
     const existing = articles.find(a => a.title.toLowerCase() === title.toLowerCase());
     if (existing) {
@@ -1498,7 +1614,7 @@ async function saveResearchToWiki(report) {
       existing.modifiedAt = Date.now(); existing.embedding = null;
       await dbPut('articles', existing);
     } else {
-      await dbPut('articles', { id: uid(), title, content, summary: '', concepts: [], sources: [], createdAt: Date.now(), modifiedAt: Date.now(), embedding: null });
+      await dbPut('articles', { id: uid(), title, content, summary: '', concepts: [], tags: [], sources: [], createdAt: Date.now(), modifiedAt: Date.now(), embedding: null, deletedAt: null });
     }
   }
   const reportArt = {
@@ -1518,6 +1634,7 @@ async function saveResearchToWiki(report) {
 async function buildGraphData({ tag = null } = {}) {
   let articles = await getActiveArticles();
   if (tag) articles = articles.filter(a => (a.tags || []).includes(tag));
+  const titles = articles.map(a => a.title);
   const titleToId = {};
   articles.forEach(a => titleToId[a.title.toLowerCase()] = a.id);
   const nodes = articles.map(a => ({
@@ -1528,7 +1645,9 @@ async function buildGraphData({ tag = null } = {}) {
   for (const a of articles) {
     const links = extractWikilinks(a.content);
     for (const l of links) {
-      const targetId = titleToId[l.toLowerCase()];
+      const resolved = resolveWikilinkTarget(l, titles);
+      if (!resolved) continue;
+      const targetId = titleToId[resolved.toLowerCase()];
       if (targetId && targetId !== a.id) {
         const key = [a.id, targetId].sort().join('::');
         if (!edgesSet.has(key)) { edgesSet.add(key); edges.push({ source: a.id, target: targetId }); }
@@ -2851,12 +2970,32 @@ function synonymLabel(s) { return `${lintItemText(s.name1 ?? s.title1 ?? '')} �
 
 async function renderLintView() {
   const root = $('#view-lint'); root.innerHTML = '';
-  root.appendChild(el('div', { class: 'card', style: 'display:flex;justify-content:space-between;align-items:center' }, [
+  root.appendChild(el('div', { class: 'card', style: 'display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px' }, [
     el('div', {}, [el('strong', {}, 'Análisis de integridad'), el('p', { class: 'hint' }, 'La IA revisa enlaces rotos entre artículos, posibles duplicados y contenido incompleto.')]),
     el('button', { class: 'btn btn-primary', id: 'lint-btn' }, [el('span', { html: ICONS.play }), 'Analizar wiki']),
   ]));
+  root.appendChild(el('div', { class: 'card', style: 'margin-top:14px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px' }, [
+    el('div', {}, [el('strong', {}, '🔗 Reenlazar toda la wiki'), el('p', { class: 'hint' }, 'Revisa TODOS los artículos existentes: corrige enlaces con redacción distinta al título real y añade enlaces automáticos a menciones de otros artículos que aún estén en texto plano. No usa la IA, es instantáneo y no cuesta nada.')]),
+    el('button', { class: 'btn', id: 'relink-btn' }, [el('span', { html: ICONS.link }), 'Reenlazar ahora']),
+  ]));
+  const relinkResult = el('div', { id: 'relink-result' });
+  root.appendChild(relinkResult);
   const resultRoot = el('div', { id: 'lint-result', style: 'margin-top:18px' });
   root.appendChild(resultRoot);
+
+  $('#relink-btn').addEventListener('click', async (e) => {
+    e.target.disabled = true;
+    const original = e.target.innerHTML;
+    e.target.innerHTML = '<span class="spinner"></span> Reenlazando…';
+    try {
+      const { changed, total } = await relinkAllArticles();
+      relinkResult.innerHTML = '';
+      relinkResult.appendChild(el('div', { class: 'card', style: 'margin-top:14px;border-color:var(--success-soft)' },
+        changed ? `✓ ${changed} de ${total} artículo(s) actualizados con nuevos enlaces.` : `Revisados ${total} artículo(s): ya estaban todos bien enlazados.`));
+      await refreshSidebar();
+    } catch (err) { toast(err.message, 'error'); }
+    finally { e.target.disabled = false; e.target.innerHTML = original; }
+  });
 
   $('#lint-btn').addEventListener('click', async () => {
     if (!Settings.getApiKey()) { showOnboarding(); return; }
